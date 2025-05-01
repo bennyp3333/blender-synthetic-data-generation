@@ -451,19 +451,24 @@ class SyntheticDataGenerator:
             return 640, 480  # Default fallback
     
     def project_point_to_camera(self, point_3d):
-        """Project a 3D point to 2D camera space with normalized coordinates."""
+        """Project a 3D point to 2D camera space with pixel coordinates."""
         try:
             scene = bpy.context.scene
+            render = scene.render
             
             # Use Blender's built-in function to convert world coordinates to camera view
             co_2d = bpy_extras.object_utils.world_to_camera_view(scene, self.camera, Vector(point_3d))
             
             # co_2d returns normalized coordinates (0-1)
-            x, y = co_2d.x, co_2d.y
+            x, y, z = co_2d
             
-            # Check if point is within frame
-            if 0 <= x <= 1 and 0 <= y <= 1:
-                return (x, y)
+            # Convert normalized coordinates to pixel coordinates
+            screen_x = x * render.resolution_x
+            screen_y = (1 - y) * render.resolution_y  # Flip Y to match image coordinates (top-left origin)
+            
+            # Check if point is within frame and in front of camera
+            if 0 <= x <= 1 and 0 <= y <= 1 and z > 0:
+                return (screen_x, screen_y)
             else:
                 return None
                 
@@ -531,8 +536,10 @@ class SyntheticDataGenerator:
             return None
         
     def get_keypoints_2d(self):
-        """Get all keypoints projected to 2D camera view."""
+        """Get all keypoints projected to 2D camera view in pixel coordinates."""
         keypoints_2d = {}
+        scene = bpy.context.scene
+        render = scene.render
         
         for kp_name, kp_info in self.keypoints.items():
             # Get 3D position
@@ -550,12 +557,13 @@ class SyntheticDataGenerator:
             
             # Store if visible
             if pos_2d is not None:
-                # Convert to image coordinates for annotation
+                # Already converted to pixel coordinates in project_point_to_camera
+                x, y = pos_2d
                 keypoints_2d[kp_name] = {
-                    'position': pos_2d,  # Normalized coordinates (x, y)
+                    'position': pos_2d,  # Pixel coordinates (x, y)
                     'visible': True
                 }
-                print(f"Keypoint '{kp_name}' is visible at normalized position {pos_2d}")
+                print(f"Keypoint '{kp_name}' is visible at pixel position ({x:.1f}, {y:.1f})")
             else:
                 # Keypoint is out of view or behind camera
                 keypoints_2d[kp_name] = {
@@ -567,82 +575,91 @@ class SyntheticDataGenerator:
         return keypoints_2d
 
     def find_bounding_box(self):
-        """Calculate the 2D bounding box of the model in camera view."""
+        """Calculate the 2D bounding box of the model in camera view with pixel coordinates."""
         try:
             scene = bpy.context.scene
+            render = scene.render
             
-            # Get the camera matrix
-            camera_matrix = self.camera.matrix_world.normalized().inverted()
+            # Get render dimensions
+            render_width = render.resolution_x
+            render_height = render.resolution_y
             
-            # Create a temporary mesh from the model
+            # For collecting valid vertices in screen space
+            coords_2d = []
+            
+            # Get the mesh data from the model
             depsgraph = bpy.context.evaluated_depsgraph_get()
             obj_eval = self.model.evaluated_get(depsgraph)
             mesh = obj_eval.to_mesh()
-            mesh.transform(self.model.matrix_world)
-            mesh.transform(camera_matrix)
             
-            # Get camera frame in world space
-            frame = [-v for v in self.camera.data.view_frame(scene=scene)[:3]]
-            
-            # Collect coordinates of vertices in camera view
-            x_coords = []
-            y_coords = []
-            
+            # Transform each vertex to camera view and collect visible ones
             for vertex in mesh.vertices:
-                co_local = vertex.co
-                z = -co_local.z
+                # Convert vertex from object space to world space
+                vert_world = self.model.matrix_world @ vertex.co
                 
-                if z <= 0.0:
-                    # Vertex is behind the camera
-                    continue
+                # Project the 3D point to camera space
+                co_2d = bpy_extras.object_utils.world_to_camera_view(scene, self.camera, vert_world)
+                x, y, z = co_2d
                 
-                # Perspective division
-                frame_scaled = [(v / (v.z / z)) for v in frame]
-                
-                min_x, max_x = frame_scaled[1].x, frame_scaled[2].x
-                min_y, max_y = frame_scaled[0].y, frame_scaled[1].y
-                
-                # Convert to normalized coordinates
-                x = (co_local.x - min_x) / (max_x - min_x)
-                y = (co_local.y - min_y) / (max_y - min_y)
-                
-                x_coords.append(x)
-                y_coords.append(y)
+                # Only include points that are in front of the camera
+                if z > 0:
+                    # Convert normalized coordinates to pixel coordinates
+                    screen_x = x * render_width
+                    screen_y = (1 - y) * render_height  # Flip Y to match image coordinates (top-left origin)
+                    
+                    coords_2d.append((screen_x, screen_y))
             
-            # Remove the temporary mesh
+            # Clean up the temporary mesh
             obj_eval.to_mesh_clear()
             
             # Return None if model is not visible
-            if not x_coords or not y_coords:
+            if not coords_2d:
                 print("Model not visible in camera view")
                 return None
             
-            # Calculate and clip bounding box
-            min_x = max(0.0, min(x_coords))
-            min_y = max(0.0, min(y_coords))
-            max_x = min(1.0, max(x_coords))
-            max_y = min(1.0, max(y_coords))
+            # Calculate bounding box in pixel coordinates
+            min_x = max(0, min(x for x, y in coords_2d))
+            min_y = max(0, min(y for x, y in coords_2d))
+            max_x = min(render_width, max(x for x, y in coords_2d))
+            max_y = min(render_height, max(y for x, y in coords_2d))
             
             # Return None if bounding box has no area
             if min_x >= max_x or min_y >= max_y:
                 print("Bounding box has no area")
                 return None
             
-            # Convert to [x, y, width, height] format
+            # Calculate width, height and center
             width = max_x - min_x
             height = max_y - min_y
             center_x = min_x + width / 2
             center_y = min_y + height / 2
             
-            print(f"Bounding box calculated: center=({center_x:.2f}, {center_y:.2f}), size=({width:.2f}, {height:.2f})")
+            print(f"Bounding box calculated (pixel coordinates):")            
+            print(f"  min_x: {min_x}")
+            print(f"  min_y: {min_y}")
+            print(f"  max_x: {max_x}")
+            print(f"  max_y: {max_y}")
+            print(f"  center_x: {center_x}")
+            print(f"  center_y: {center_y}")
+            print(f"  width: {width}")
+            print(f"  height: {height}")
+            
             
             return {
-                'bbox': [center_x, center_y, width, height],
-                'bbox_corners': [(min_x, min_y), (max_x, max_y)]
+                'min_x': min_x,
+                'min_y': min_y,
+                'max_x': max_x,
+                'max_y': max_y,
+                'center_x': center_x,
+                'center_y': center_y,
+                'width': width,
+                'height': height
             }
             
         except Exception as e:
             print(f"Error calculating bounding box: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def render_image(self, output_path):
@@ -678,13 +695,12 @@ class SyntheticDataGenerator:
             # Get keypoints
             keypoints_2d = self.get_keypoints_2d()
             
-            # Format for detection datasets (similar to COCO format)
+            # Format for detection datasets
             annotation = {
                 'image_id': image_id,
                 'image_width': width,
                 'image_height': height,
-                'bbox': bbox_data['bbox'],  # [x_center, y_center, width, height] (normalized)
-                'bbox_corners': bbox_data['bbox_corners'],  # [(min_x, min_y), (max_x, max_y)] (normalized)
+                'bbox': bbox_data,  # [x_min, y_min, x_max, y_max, width, height, x_center, y_center] (pixels)
                 'category_id': 0,  # Class ID (0 for the model)
                 'category_name': self.model_name,
                 'distance': (self.camera.location - self.model.location).length,
@@ -788,7 +804,7 @@ def main():
         'model_name': 'Red_Bull_Can_250ml_v1',  # Change to your model name
         'output_dir': 'synthetic_data',  # Relative to blend file
         'hdri_dir': 'hdris',  # Relative to blend file
-        'num_images': 5,  # Number of images to generate
+        'num_images': 100,  # Number of images to generate
         'camera_min_distance': 0.25,
         'camera_max_distance': 0.5,
         'min_focal_length': 24,  # Min focal length in mm
@@ -796,7 +812,7 @@ def main():
         'max_roll_angle': 20,        # Maximum roll angle in degrees
         'extreme_angles_prob': 0.1,  # Probability of extreme angles
         'ensure_visible': True,      # Check if model is visible
-        'render_samples': 1024,  # Cycles samples
+        'render_samples': 512,  # Cycles samples
         'debug_mode': False,
         
         # Define keypoints for tracking specific model parts

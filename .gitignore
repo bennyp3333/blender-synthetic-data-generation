@@ -174,5 +174,8 @@ cython_debug/
 .pypirc
 
 /synthetic_data
+/synthetic_data_train
+/synthetic_data_val
+/synthetic_data_test
 *.blend1
 *.hdr
