@@ -355,10 +355,13 @@ class SyntheticDataGenerator:
             
             # Adjust depth of field
             if hasattr(self.camera.data, 'dof'):
-                self.camera.data.dof.use_dof = True
+                if random.random() < 0.2:
+                    self.camera.data.dof.use_dof = True
+                else:
+                    self.camera.data.dof.use_dof = False
                 self.camera.data.dof.focus_distance = distance
-                self.camera.data.dof.aperture_fstop = random.uniform(1.4, 5.6)
-                print(f"Using depth of field with f/{self.camera.data.dof.aperture_fstop:.1f}")
+                self.camera.data.dof.aperture_fstop = random.uniform(1.4, 2.4)
+                print(f"Using depth of field: {self.camera.data.dof.use_dof} with aperture f/{self.camera.data.dof.aperture_fstop:.1f}")
                 
             # Adjust sensor size for perspective variation
             self.camera.data.sensor_width = random.uniform(20, 45)
@@ -436,6 +439,9 @@ class SyntheticDataGenerator:
                                         weights=norm_probabilities, k=1)[0]
             
             width, height = map(int, chosen_res.split('x'))
+
+            if random.random() < 0.5:
+                width, height = height, width
             
             scene = bpy.context.scene
             scene.render.resolution_x = width
@@ -804,7 +810,7 @@ def main():
         'model_name': 'Red_Bull_Can_250ml_v1',  # Change to your model name
         'output_dir': 'synthetic_data',  # Relative to blend file
         'hdri_dir': 'hdris',  # Relative to blend file
-        'num_images': 100,  # Number of images to generate
+        'num_images': 1,  # Number of images to generate
         'camera_min_distance': 0.25,
         'camera_max_distance': 0.5,
         'min_focal_length': 24,  # Min focal length in mm
