@@ -11,7 +11,7 @@ from math import radians, degrees, pi
 class SyntheticDataGenerator:
     """
     Generates synthetic training data for 2D object tracking by rendering images 
-    of a model in random environments with random camera positions.
+    of multiple models in random environments with random camera positions.
     """
     
     def __init__(self, config):
@@ -27,9 +27,17 @@ class SyntheticDataGenerator:
         self.hdri_dir = os.path.normpath(os.path.join(blend_dir, config.get('hdri_dir', 'hdris')))
         
         self.num_images = config.get('num_images', 10)
-        
-        # Get keypoints configuration
-        self.keypoints = config.get('keypoints', {})
+
+        # Get model configuration - now a list of model specifications
+        self.models_config = config.get('models', [])
+        if not self.models_config:
+            raise ValueError("No models defined in configuration")
+            
+        # Initialize list to store model objects and their properties
+        self.models = []
+
+        # Load all models defined in config
+        self.load_models()
         
         # Create output directories
         self.images_dir = os.path.join(self.output_dir, 'images')
@@ -45,95 +53,76 @@ class SyntheticDataGenerator:
             self.camera = bpy.data.objects['Camera']
         except KeyError:
             raise ValueError("Camera not found in scene. Please add a camera.")
-            
-        self.model = bpy.data.objects.get(self.model_name)
-        if not self.model:
-            raise ValueError(f"Model '{self.model_name}' not found in the scene. Available objects: {', '.join([obj.name for obj in bpy.data.objects])}")
-  
-        # Validate keypoints
-        self.validate_keypoints()
-
-        # Add visual markers for keypoints if debug mode is enabled
-        if self.config.get('debug_mode', False):
-            self.add_debug_markers()
         
         # Print initialization success
         print(f"\nSynthetic Data Generator initialized with configuration:")
-        print(f"- Model: {self.model_name}")
+        print(f"- Models: {', '.join([model['obj'].name for model in self.models])}")
         print(f"- Output directory: {self.output_dir}")
         print(f"- Number of images: {self.num_images}")
         print(f"- HDRI directory: {self.hdri_dir} ({'Not found' if not self.hdri_files else f'{len(self.hdri_files)} HDRIs found'})")
-        print(f"- Keypoints defined: {len(self.keypoints)}")
         print()
 
-    def validate_keypoints(self):
-        """Validate that all defined keypoints can be found in the scene."""
-        for kp_name, kp_info in self.keypoints.items():
-            # Check for object-based keypoints
-            if 'object' in kp_info:
-                obj_name = kp_info['object']
-                if obj_name not in bpy.data.objects:
-                    print(f"Warning: Keypoint '{kp_name}' references non-existent object '{obj_name}'")
-            
-            # Check for vertex-based keypoints
-            elif 'vertex_group' in kp_info and 'vertex_index' in kp_info:
-                vg_name = kp_info['vertex_group']
-                vertex_idx = kp_info['vertex_index']
-                
-                # Check if the vertex group exists
-                if self.model.type == 'MESH':
-                    if vg_name not in self.model.vertex_groups:
-                        print(f"Warning: Keypoint '{kp_name}' references non-existent vertex group '{vg_name}'")
-                    else:
-                        # Check if vertex index is valid
-                        if vertex_idx >= len(self.model.data.vertices):
-                            print(f"Warning: Keypoint '{kp_name}' references invalid vertex index {vertex_idx}")
-                else:
-                    print(f"Warning: Model '{self.model_name}' is not a mesh, cannot use vertex-based keypoints")
-            
-            # Check for empty-based keypoints
-            elif 'empty' in kp_info:
-                empty_name = kp_info['empty']
-                if empty_name not in bpy.data.objects or bpy.data.objects[empty_name].type != 'EMPTY':
-                    print(f"Warning: Keypoint '{kp_name}' references non-existent empty '{empty_name}'")
-            
-            # Check for bone-based keypoints
-            elif 'armature' in kp_info and 'bone' in kp_info:
-                armature_name = kp_info['armature']
-                bone_name = kp_info['bone']
-                
-                if armature_name not in bpy.data.objects or bpy.data.objects[armature_name].type != 'ARMATURE':
-                    print(f"Warning: Keypoint '{kp_name}' references non-existent armature '{armature_name}'")
-                elif bone_name not in bpy.data.objects[armature_name].data.bones:
-                    print(f"Warning: Keypoint '{kp_name}' references non-existent bone '{bone_name}'")
-            
-            # Invalid keypoint specification
-            else:
-                print(f"Warning: Keypoint '{kp_name}' has invalid specification: {kp_info}")
-                print("A keypoint must reference either an 'object', 'empty', or 'vertex_group'+'vertex_index', or 'armature'+'bone'")
-
-    def add_debug_markers(self):
-        """Add visible markers at keypoint positions for visual debugging."""
-        # Remove any existing debug markers
-        for obj in bpy.data.objects:
-            if obj.name.startswith("DEBUG_MARKER_"):
-                bpy.data.objects.remove(obj)
+    def load_models(self):
+        """Load all models defined in the configuration."""
+        self.models = []
         
-        # Create new markers at keypoint positions
-        for kp_name, kp_info in self.keypoints.items():
-            pos_3d = self.get_keypoint_position(kp_info)
-            if pos_3d:
-                # Create empty as marker
-                marker = bpy.data.objects.new(f"DEBUG_MARKER_{kp_name}", None)
-                marker.empty_display_type = 'SPHERE'
-                marker.empty_display_size = 0.02
-                marker.location = pos_3d
-                # Set color for visibility
-                marker.color = (1.0, 0.0, 0.0, 1.0)  # Bright red
-                bpy.context.collection.objects.link(marker)
-                print(f"Added debug marker for '{kp_name}' at {pos_3d}")
-            else:
-                print(f"Could not place debug marker for '{kp_name}', position unknown")
+        # Collect all categories for tracking
+        self.categories = []
+        category_ids = {}  # To track assigned IDs
+        next_category_id = 0
+        
+        for model_config in self.models_config:
+            model_name = model_config.get('name')
+            
+            if not model_name:
+                print(f"Warning: Model configuration missing name, skipping")
+                continue
+                
+            # Try to find the model in the scene
+            model_obj = None
+            for obj in bpy.data.objects:
+                if obj.name == model_name:
+                    model_obj = obj
+                    break
+            
+            if not model_obj:
+                print(f"Warning: Model '{model_name}' not found in scene, skipping")
+                continue
+                
+            # Get or assign category ID and name
+            category_name = model_config.get('category', model_name)
+            
+            # If this category hasn't been seen before, assign a new ID
+            if category_name not in category_ids:
+                category_ids[category_name] = next_category_id
+                next_category_id += 1
+                # Add to categories list
+                self.categories.append({
+                    'id': category_ids[category_name],
+                    'name': category_name
+                })
+            
+            # Store model with its properties
+            model_data = {
+                'obj': model_obj,
+                'category_id': category_ids[category_name],
+                'category_name': category_name
+            }
+            
+            # Add any extra properties from config
+            for key, value in model_config.items():
+                if key not in ['name', 'category']:
+                    model_data[key] = value
+                    
+            self.models.append(model_data)
+            print(f"Loaded model: {model_name} (Category: {category_name}, ID: {category_ids[category_name]})")
+        
+        print(f"Total models loaded: {len(self.models)}")
+        categories_list = [f'{c["name"]} (ID: {c["id"]})' for c in self.categories]
+        print(f"Categories: {', '.join(categories_list)}")
+        
+        if not self.models:
+            raise ValueError("No valid models were found in the scene. Please check your configuration.")
 
     def get_hdri_files(self):
         """Get list of HDRI files from the HDRI directory."""
@@ -242,17 +231,42 @@ class SyntheticDataGenerator:
     def set_random_camera(self):
         """Position camera randomly with advanced variation options."""
         try:
-            # Get model position and dimensions
-            target_pos = self.model.location.copy()
+            # Calculate center of all models as target
+            if not self.models:
+                print("No models to position camera for")
+                return False
+                
+            # Use the first model as primary target
+            target_pos = Vector((0, 0, 0))
+            weights_sum = 0
             
-            # Get model size
-            if hasattr(self.model, 'dimensions'):
-                model_dims = self.model.dimensions
-                max_dim = max(model_dims)
-                min_dim = min([d for d in model_dims if d > 0] or [0.1])
+            # Calculate weighted center of all models
+            for model in self.models:
+                model_obj = model['obj']
+                # Use model's location with a weight
+                weight = 1.0  # Default weight
+                target_pos += model_obj.location * weight
+                weights_sum += weight
+                
+            # Normalize by weight sum
+            if weights_sum > 0:
+                target_pos /= weights_sum
             else:
-                max_dim = 1.0
-                min_dim = 0.1
+                # Fallback to first model if weights don't work
+                target_pos = self.models[0]['obj'].location.copy()
+            
+            # Find maximum dimension across all models for distance calculation
+            max_dim = 0.1
+            min_dim = 0.1
+            
+            for model in self.models:
+                model_obj = model['obj']
+                if hasattr(model_obj, 'dimensions'):
+                    model_dims = model_obj.dimensions
+                    local_max_dim = max(model_dims)
+                    local_min_dim = min([d for d in model_dims if d > 0] or [0.1])
+                    max_dim = max(max_dim, local_max_dim)
+                    min_dim = min(min_dim, local_min_dim) if local_min_dim > 0 else min_dim
                 
             # Select a camera mode - different shot types
             camera_modes = {
@@ -369,9 +383,11 @@ class SyntheticDataGenerator:
             print(f"Camera at ({x:.2f}, {y:.2f}, {z:.2f}) with {self.camera.data.lens:.1f}mm lens")
             print(f"Target offset: ({offset_x:.2f}, {offset_y:.2f}, {offset_z:.2f}), Roll: {degrees(roll_angle):.1f}°")
             
-            # Safety check - simulate rendering a few points to confirm model will be somewhat in frame
+            # Safety check - for each model
             if self.config.get('ensure_visible', True):
-                self.check_model_visibility()
+                visible_models = self.check_models_visibility()
+                if not visible_models:
+                    print("Warning: No models visible in frame")
                 
             return True
             
@@ -381,45 +397,59 @@ class SyntheticDataGenerator:
             traceback.print_exc()
             return False
 
-    def check_model_visibility(self):
-        """Check if any part of the model would be visible in the frame."""
-        try:
-            # For mesh objects, check vertices
-            if self.model.type == 'MESH':
-                # Get model vertices in world space
-                mesh = self.model.data
-                matrix_world = self.model.matrix_world
-                
-                # Sample some vertices (for efficiency)
-                vertices = []
-                sample_size = min(50, len(mesh.vertices))  # Sample up to 50 vertices
-                sample_indices = random.sample(range(len(mesh.vertices)), sample_size)
-                
-                for idx in sample_indices:
-                    # Transform vertex to world space
-                    vertex_world = matrix_world @ mesh.vertices[idx].co
-                    vertices.append(vertex_world)
+    def check_models_visibility(self):
+        """Check if any parts of the models would be visible in the frame."""
+        visible_models = []
+        
+        for model in self.models:
+            model_obj = model['obj']
+            
+            try:
+                # For mesh objects, check vertices
+                if model_obj.type == 'MESH':
+                    # Get model vertices in world space
+                    mesh = model_obj.data
+                    matrix_world = model_obj.matrix_world
                     
-                # Also add object origin and bounding box corners
-                vertices.append(self.model.location)
-                
-                # Project vertices to camera
-                visible_points = 0
-                for point in vertices:
-                    projection = self.project_point_to_camera(point)
-                    if projection:
-                        visible_points += 1
-                
-                visibility_percentage = (visible_points / len(vertices)) * 100
-                print(f"Model visibility check: {visible_points}/{len(vertices)} sample points visible ({visibility_percentage:.1f}%)")
-                
-                # If almost no points are visible, warn but don't fail
-                if visible_points < 3:
-                    print("WARNING: Model may be poorly visible or out of frame!")
+                    # Sample some vertices (for efficiency)
+                    vertices = []
+                    if len(mesh.vertices) > 0:
+                        sample_size = min(50, len(mesh.vertices))
+                        if sample_size > 0:
+                            sample_indices = random.sample(range(len(mesh.vertices)), sample_size)
+                        else:
+                            sample_indices = []
+                    else:
+                        sample_indices = []
                     
-        except Exception as e:
-            print(f"Error checking model visibility: {e}")
-            # Don't fail the camera setup if this check fails
+                    for idx in sample_indices:
+                        # Transform vertex to world space
+                        vertex_world = matrix_world @ mesh.vertices[idx].co
+                        vertices.append(vertex_world)
+                        
+                    # Also add object origin
+                    vertices.append(model_obj.location)
+                    
+                    # Project vertices to camera
+                    visible_points = 0
+                    for point in vertices:
+                        projection = self.project_point_to_camera(point)
+                        if projection:
+                            visible_points += 1
+                    
+                    visibility_percentage = (visible_points / len(vertices)) * 100
+                    print(f"Model {model_obj.name} visibility check: {visible_points}/{len(vertices)} sample points visible ({visibility_percentage:.1f}%)")
+                    
+                    # Count model as visible if enough points are visible
+                    if visible_points >= 3:
+                        visible_models.append(model_obj.name)
+                    else:
+                        print(f"WARNING: Model {model_obj.name} may be poorly visible or out of frame!")
+                        
+            except Exception as e:
+                print(f"Error checking visibility for model {model_obj.name}: {e}")
+        
+        return visible_models
     
     def set_random_resolution(self):
         """Set a random resolution for rendering."""
@@ -482,106 +512,8 @@ class SyntheticDataGenerator:
             print(f"Error projecting point: {e}")
             return None
     
-    def get_keypoint_position(self, kp_info):
-        """Get the 3D world position of a keypoint based on its specification."""
-        try:
-            # Object-based keypoint
-            if 'object' in kp_info:
-                obj = bpy.data.objects.get(kp_info['object'])
-                if obj:
-                    # Get object origin or specific offset
-                    if 'offset' in kp_info:
-                        # Local offset from object origin
-                        offset = Vector(kp_info['offset'])
-                        # Transform offset to world space
-                        world_pos = obj.matrix_world @ offset
-                    else:
-                        # Just use object origin
-                        world_pos = obj.matrix_world.translation.copy()
-                    return world_pos
-            
-            # Vertex-based keypoint
-            elif 'vertex_group' in kp_info and 'vertex_index' in kp_info:
-                if self.model.type == 'MESH':
-                    vertex_idx = kp_info['vertex_index']
-                    if vertex_idx < len(self.model.data.vertices):
-                        # Get vertex position in local space
-                        local_pos = self.model.data.vertices[vertex_idx].co
-                        # Transform to world space
-                        world_pos = self.model.matrix_world @ local_pos
-                        return world_pos
-            
-            # Empty-based keypoint
-            elif 'empty' in kp_info:
-                empty = bpy.data.objects.get(kp_info['empty'])
-                if empty and empty.type == 'EMPTY':
-                    return empty.matrix_world.translation.copy()
-            
-            # Bone-based keypoint
-            elif 'armature' in kp_info and 'bone' in kp_info:
-                armature = bpy.data.objects.get(kp_info['armature'])
-                if armature and armature.type == 'ARMATURE':
-                    bone_name = kp_info['bone']
-                    if bone_name in armature.data.bones:
-                        bone = armature.data.bones[bone_name]
-                        if 'head' in kp_info and kp_info['head']:
-                            # Use bone head
-                            pos_local = bone.head_local
-                        else:
-                            # Use bone tail (default)
-                            pos_local = bone.tail_local
-                        # Transform to world space
-                        world_pos = armature.matrix_world @ pos_local
-                        return world_pos
-            
-            # If we got here, keypoint couldn't be resolved
-            return None
-            
-        except Exception as e:
-            print(f"Error getting keypoint position: {e}")
-            return None
-        
-    def get_keypoints_2d(self):
-        """Get all keypoints projected to 2D camera view in pixel coordinates."""
-        keypoints_2d = {}
-        scene = bpy.context.scene
-        render = scene.render
-        
-        for kp_name, kp_info in self.keypoints.items():
-            # Get 3D position
-            pos_3d = self.get_keypoint_position(kp_info)
-            if pos_3d is None:
-                print(f"Could not determine 3D position for keypoint '{kp_name}'")
-                keypoints_2d[kp_name] = {
-                    'position': None,
-                    'visible': False
-                }
-                continue
-                
-            # Project to 2D
-            pos_2d = self.project_point_to_camera(pos_3d)
-            
-            # Store if visible
-            if pos_2d is not None:
-                # Already converted to pixel coordinates in project_point_to_camera
-                x, y = pos_2d
-                keypoints_2d[kp_name] = {
-                    'position': pos_2d,  # Pixel coordinates (x, y)
-                    'visible': True
-                }
-                print(f"Keypoint '{kp_name}' is visible at pixel position ({x:.1f}, {y:.1f})")
-            else:
-                # Keypoint is out of view or behind camera
-                keypoints_2d[kp_name] = {
-                    'position': None,
-                    'visible': False
-                }
-                print(f"Keypoint '{kp_name}' is not visible")
-                    
-        return keypoints_2d
-
-    def find_bounding_box(self):
-        """Calculate the 2D bounding box of the model in camera view with pixel coordinates."""
+    def find_model_bounding_box(self, model_obj):
+        """Calculate the 2D bounding box of a specific model in camera view with pixel coordinates."""
         try:
             scene = bpy.context.scene
             render = scene.render
@@ -595,13 +527,13 @@ class SyntheticDataGenerator:
             
             # Get the mesh data from the model
             depsgraph = bpy.context.evaluated_depsgraph_get()
-            obj_eval = self.model.evaluated_get(depsgraph)
+            obj_eval = model_obj.evaluated_get(depsgraph)
             mesh = obj_eval.to_mesh()
             
             # Transform each vertex to camera view and collect visible ones
             for vertex in mesh.vertices:
                 # Convert vertex from object space to world space
-                vert_world = self.model.matrix_world @ vertex.co
+                vert_world = model_obj.matrix_world @ vertex.co
                 
                 # Project the 3D point to camera space
                 co_2d = bpy_extras.object_utils.world_to_camera_view(scene, self.camera, vert_world)
@@ -620,7 +552,7 @@ class SyntheticDataGenerator:
             
             # Return None if model is not visible
             if not coords_2d:
-                print("Model not visible in camera view")
+                print(f"Model {model_obj.name} not visible in camera view")
                 return None
             
             # Calculate bounding box in pixel coordinates
@@ -631,7 +563,7 @@ class SyntheticDataGenerator:
             
             # Return None if bounding box has no area
             if min_x >= max_x or min_y >= max_y:
-                print("Bounding box has no area")
+                print(f"Bounding box for {model_obj.name} has no area")
                 return None
             
             # Calculate width, height and center
@@ -640,16 +572,11 @@ class SyntheticDataGenerator:
             center_x = min_x + width / 2
             center_y = min_y + height / 2
             
-            print(f"Bounding box calculated (pixel coordinates):")            
-            print(f"  min_x: {min_x}")
-            print(f"  min_y: {min_y}")
-            print(f"  max_x: {max_x}")
-            print(f"  max_y: {max_y}")
-            print(f"  center_x: {center_x}")
-            print(f"  center_y: {center_y}")
-            print(f"  width: {width}")
-            print(f"  height: {height}")
-            
+            print(f"Bounding box for {model_obj.name} calculated (pixel coordinates):")            
+            print(f"  min_x: {min_x:.1f}, min_y: {min_y:.1f}")
+            print(f"  max_x: {max_x:.1f}, max_y: {max_y:.1f}")
+            print(f"  center_x: {center_x:.1f}, center_y: {center_y:.1f}")
+            print(f"  width: {width:.1f}, height: {height:.1f}")
             
             return {
                 'min_x': min_x,
@@ -663,10 +590,30 @@ class SyntheticDataGenerator:
             }
             
         except Exception as e:
-            print(f"Error calculating bounding box: {e}")
+            print(f"Error calculating bounding box for {model_obj.name}: {e}")
             import traceback
             traceback.print_exc()
             return None
+
+    def find_bounding_boxes(self):
+        """Calculate bounding boxes for all models in the scene."""
+        bboxes = []
+        
+        for model_data in self.models:
+            model_obj = model_data['obj']
+            category_id = model_data.get('category_id', 0)
+            category_name = model_data.get('category_name', model_obj.name)
+            
+            bbox = self.find_model_bounding_box(model_obj)
+            if bbox:
+                # Add model metadata to bbox data
+                bbox['model_name'] = model_obj.name
+                bbox['category_id'] = category_id
+                bbox['category_name'] = category_name
+                bbox['distance'] = (self.camera.location - model_obj.location).length
+                bboxes.append(bbox)
+        
+        return bboxes
     
     def render_image(self, output_path):
         """Render the current scene to an image file."""
@@ -691,29 +638,40 @@ class SyntheticDataGenerator:
         except Exception as e:
             print(f"Error rendering image: {e}")
             return False
-    
-    def create_annotations(self, image_id, width, height, bbox_data):
-        """Create annotation data for the image."""
-        if not bbox_data:
+
+    def create_annotations(self, image_id, width, height, bboxes_data):
+        """Create annotation data for each model in the image."""
+        if not bboxes_data:
             return None
         
         try:
-            # Get keypoints
-            keypoints_2d = self.get_keypoints_2d()
+            annotations = []
             
-            # Format for detection datasets
-            annotation = {
-                'image_id': image_id,
-                'image_width': width,
-                'image_height': height,
-                'bbox': bbox_data,  # [x_min, y_min, x_max, y_max, width, height, x_center, y_center] (pixels)
-                'category_id': 0,  # Class ID (0 for the model)
-                'category_name': self.model_name,
-                'distance': (self.camera.location - self.model.location).length,
-                'keypoints': keypoints_2d
-            }
+            for i, bbox in enumerate(bboxes_data):
+                # Format for detection datasets
+                annotation = {
+                    'id': f"{image_id}_{i}",
+                    'image_id': image_id,
+                    'image_width': width,
+                    'image_height': height,
+                    'bbox': {
+                        'min_x': bbox['min_x'], 
+                        'min_y': bbox['min_y'], 
+                        'max_x': bbox['max_x'], 
+                        'max_y': bbox['max_y'],
+                        'width': bbox['width'], 
+                        'height': bbox['height'], 
+                        'center_x': bbox['center_x'], 
+                        'center_y': bbox['center_y']
+                    },
+                    'category_id': bbox['category_id'],
+                    'category_name': bbox['category_name'],
+                    'distance': bbox['distance'],
+                    'model_name': bbox['model_name']
+                }
+                annotations.append(annotation)
             
-            return annotation
+            return annotations
             
         except Exception as e:
             print(f"Error creating annotations: {e}")
@@ -744,12 +702,12 @@ class SyntheticDataGenerator:
             # Set random resolution
             width, height = self.set_random_resolution()
             
-            # Calculate bounding box
-            bbox_data = self.find_bounding_box()
+            # Calculate bounding boxes for all models
+            bboxes_data = self.find_bounding_boxes()
             
-            # Skip if model not visible
-            if not bbox_data:
-                print(f"Model not visible in image {image_id}, skipping")
+            # Skip if no models are visible
+            if not bboxes_data:
+                print(f"No models visible in image {image_id}, skipping")
                 failed_renders += 1
                 continue
             
@@ -764,36 +722,32 @@ class SyntheticDataGenerator:
                 failed_renders += 1
                 continue
                 
-            # Create annotation
-            annotation = self.create_annotations(image_id, width, height, bbox_data)
-            if annotation:
-                all_annotations.append(annotation)
+            # Create annotation for all models in the image
+            annotations = self.create_annotations(image_id, width, height, bboxes_data)
+            if annotations:
+                # Add these annotations to the full list
+                all_annotations.extend(annotations)
                 
-                # Also save individual annotation file
+                # Also save individual annotation file with all models in this image
                 indiv_anno_path = os.path.join(self.annot_dir, f"{image_id}.json")
                 with open(indiv_anno_path, 'w') as f:
-                    json.dump(annotation, f, indent=2)
+                    json.dump({
+                        'image_id': image_id,
+                        'image_width': width,
+                        'image_height': height,
+                        'annotations': annotations
+                    }, f, indent=2)
                     
                 successful_renders += 1
+                print(f"Created annotations for {len(annotations)} models in image {image_id}")
             else:
-                print(f"Failed to create annotation for image {image_id}")
+                print(f"Failed to create annotations for image {image_id}")
                 failed_renders += 1
             
             # Progress update
             progress_percent = (i+1)/self.num_images*100
             print(f"Progress: {i+1}/{self.num_images} ({progress_percent:.1f}%)")
             print(f"Success: {successful_renders}, Failed: {failed_renders}")
-        
-        # Save all annotations to a single file
-        all_anno_path = os.path.join(self.output_dir, "annotations.json")
-        with open(all_anno_path, 'w') as f:
-            json.dump({
-                'images': all_annotations,
-                'categories': [{
-                    'id': 0,
-                    'name': self.model_name
-                }]
-            }, f, indent=2)
         
         print(f"\n=== DATASET GENERATION COMPLETE ===")
         print(f"Generated {successful_renders} valid images")
@@ -807,10 +761,9 @@ def main():
     
     # Configuration (modify these settings as needed)
     config = {
-        'model_name': 'Red_Bull_Can_250ml_v1',  # Change to your model name
-        'output_dir': 'synthetic_data',  # Relative to blend file
+        'output_dir': 'synthetic_data_4',  # Relative to blend file
         'hdri_dir': 'hdris',  # Relative to blend file
-        'num_images': 1,  # Number of images to generate
+        'num_images': 10,  # Number of images to generate
         'camera_min_distance': 0.25,
         'camera_max_distance': 0.5,
         'min_focal_length': 24,  # Min focal length in mm
@@ -819,35 +772,19 @@ def main():
         'extreme_angles_prob': 0.1,  # Probability of extreme angles
         'ensure_visible': True,      # Check if model is visible
         'render_samples': 512,  # Cycles samples
-        'debug_mode': False,
         
-        # Define keypoints for tracking specific model parts
-        'keypoints': {
-            'can_top': {
-                'object': 'Red_Bull_Can_250ml_v1',  # Using the main object
-                'offset': [0, 0, 0.06],   # Offset from object origin to top (in local space)
-                'description': 'Top of the can'
+        # Define multiple models - add your models here
+        'models': [
+            {
+                'name': 'Red_Bull_Can_250ml_v1',  # Object name in Blender
+                'category': 'RedBull'  # Category name for annotations
             },
-            'can_bottom': {
-                'empty': 'Can_Bottom',  # An empty at the bottom of the can
-                'description': 'Bottom of the can'
-            },
-            
-            # Example of vertex-based keypoint (if you have a mesh):
-            # 'specific_feature': {
-            #     'vertex_group': 'MainGroup',  # Vertex group name
-            #     'vertex_index': 120,          # Index of vertex
-            #     'description': 'A specific feature on the model'
-            # },
-            
-            # Example of armature-based keypoint (if you have a rigged model):
-            # 'bone_point': {
-            #     'armature': 'BalloonRig',     # Armature object name
-            #     'bone': 'Rope1',              # Bone name
-            #     'head': True,                 # Use head of bone (default is tail)
-            #     'description': 'Connection point of rope'
-            # }
-        }
+            {
+                'name': 'Test_Box',  # Example second model
+                'category': 'Test'
+            }
+            # Add more models as needed
+        ]
     }
     
     # Print info about the scene
